@@ -197,6 +197,7 @@ pub fn build_ipv4_packet(
 /// invalid or non-local source fails fast here instead of silently producing packets
 /// with a spoofed source and mismatched transport checksums. The on-wire source still
 /// comes from the IP header we build; the bind is purely the validation/locality check.
+
 pub fn create_raw_hdrincl_socket_with_interface(
     interface: Option<&InterfaceInfo>,
     bind_src: Option<Ipv4Addr>,
@@ -207,7 +208,7 @@ pub fn create_raw_hdrincl_socket_with_interface(
     let socket = Socket::new(
         Domain::IPV4,
         Type::RAW,
-        Some(Protocol::from(libc::IPPROTO_RAW)),
+        Some(Protocol::from(255)), // IPPROTO_RAW
     )?;
 
     set_ip_hdrincl(&socket)?;
@@ -231,36 +232,66 @@ pub fn create_raw_hdrincl_socket_with_interface(
 
 /// Enable IP_HDRINCL on a raw IPv4 socket via setsockopt (portable across platforms;
 /// avoids depending on a specific socket2 helper name).
+
 fn set_ip_hdrincl(socket: &Socket) -> Result<()> {
-    use std::os::unix::io::AsRawFd;
-    let one: libc::c_int = 1;
-    // SAFETY: `socket.as_raw_fd()` yields a valid open file descriptor for the
-    // lifetime of the borrow (the `Socket` outlives this call). `IPPROTO_IP` and
-    // `IP_HDRINCL` are compile-time constants. `one` is a stack `c_int` that lives
-    // until after the call returns, so the `*const c_void` pointer and the
-    // `size_of_val(&one)` length denote a valid, initialized `c_int` for the
-    // duration of `setsockopt`. `setsockopt` itself is thread-safe and performs no
-    // synchronization that could deadlock. The only error mode is a negative
-    // return, which we translate below via `last_os_error()`.
-    let ret = unsafe {
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::IPPROTO_IP,
-            libc::IP_HDRINCL,
-            &one as *const _ as *const libc::c_void,
-            std::mem::size_of_val(&one) as libc::socklen_t,
-        )
-    };
-    if ret != 0 {
-        return Err(std::io::Error::last_os_error().into());
+    // Windows supports IP_HDRINCL too, but libc on Windows does not declare
+    // the option or the BSD fd API, so the raw ws2_32 call is used there.
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let one: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                socket.as_raw_fd(),
+                libc::IPPROTO_IP,
+                libc::IP_HDRINCL,
+                &one as *const _ as *const libc::c_void,
+                std::mem::size_of_val(&one) as libc::socklen_t,
+            )
+        };
+        if ret != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
     }
-    Ok(())
+    #[cfg(windows)]
+    {
+        const IP_HDRINCL_V4: i32 = 2; // ws2ipdef.h
+        const IPPROTO_IP_W: i32 = 0;
+        use std::os::windows::io::AsRawSocket;
+        type SOCKET = usize;
+        #[link(name = "ws2_32")]
+        unsafe extern "system" {
+            fn setsockopt(
+                s: SOCKET,
+                level: i32,
+                optname: i32,
+                optval: *const u8,
+                optlen: i32,
+            ) -> i32;
+        }
+        let val: u32 = 1;
+        let rc = unsafe {
+            setsockopt(
+                socket.as_raw_socket() as SOCKET,
+                IPPROTO_IP_W,
+                IP_HDRINCL_V4,
+                &val as *const u32 as *const u8,
+                4,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
 }
 
 /// Send a fully-formed IPv4 packet (built with [`build_ipv4_packet`]) to `dst`.
 ///
 /// The destination passed to `sendto` matches the header's destination; the port is
 /// meaningless for raw IP and is set to zero.
+
 pub fn send_raw_ipv4(socket: &Socket, packet: &[u8], dst: Ipv4Addr) -> Result<usize> {
     let addr = SocketAddr::new(IpAddr::V4(dst), 0);
     let sent = socket.send_to(packet, &SockAddr::from(addr))?;
@@ -446,7 +477,7 @@ mod tests {
     #[test]
     #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "netbsd")))]
     fn test_header_parses_with_pnet_on_network_order() {
-        use pnet::packet::ipv4::Ipv4Packet;
+        use pnet_packet::ipv4::Ipv4Packet;
         let src = Ipv4Addr::new(192, 168, 0, 1);
         let dst = Ipv4Addr::new(9, 9, 9, 9);
         let transport = vec![0u8; 12];
@@ -476,7 +507,8 @@ mod tests {
     // host-order branch NetBSD uses, giving transitive coverage of NetBSD.)
     //
     // Requires root (raw socket); ignored by default. Run with:
-    //   sudo cargo test --lib runtime_hdrincl -- --ignored --nocapture
+    //   sudo cargo test --lib runtime_hdrincl -- --ignored --nocapture#[cfg(unix)]
+
     #[test]
     #[ignore = "requires root (raw socket); run via --ignored under sudo / in CI"]
     fn runtime_hdrincl_send_all_protocols() {

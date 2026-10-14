@@ -54,6 +54,30 @@ jobs:
       - name: Format check
         run: cargo fmt -- --check
 
+  build-windows:
+    runs-on: windows-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --verbose
+
+      # Native Windows: the library compiles and its platform-neutral core
+      # (parsing, filtering, exports, state, lookup, CLI validation) runs.
+      # The probe send/recv paths land with the IPHelper backend.
+      - name: Run lib tests
+        run: cargo test --lib --verbose
+
+      - name: Clippy
+        run: cargo clippy --lib -- -D warnings
+
   build-macos:
     runs-on: macos-latest
     timeout-minutes: 30
