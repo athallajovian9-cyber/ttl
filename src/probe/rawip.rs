@@ -41,6 +41,9 @@ use std::time::Duration;
 use crate::probe::bind_to_source_ip;
 use crate::probe::interface::{InterfaceInfo, bind_socket_to_interface};
 
+/// `IPPROTO_RAW` (255) has the same value on every platform; libc only defines it on unix.
+const IPPROTO_RAW: i32 = 255;
+
 /// IPv4 header length with no options.
 pub const IPV4_HEADER_SIZE: usize = 20;
 /// UDP header length.
@@ -197,7 +200,6 @@ pub fn build_ipv4_packet(
 /// invalid or non-local source fails fast here instead of silently producing packets
 /// with a spoofed source and mismatched transport checksums. The on-wire source still
 /// comes from the IP header we build; the bind is purely the validation/locality check.
-
 pub fn create_raw_hdrincl_socket_with_interface(
     interface: Option<&InterfaceInfo>,
     bind_src: Option<Ipv4Addr>,
@@ -205,13 +207,9 @@ pub fn create_raw_hdrincl_socket_with_interface(
     // IPPROTO_RAW is the conventional "send any protocol via the header" choice. On
     // Linux it also implies IP_HDRINCL, but the BSDs do not, so we always set it
     // explicitly below.
-    let socket = Socket::new(
-        Domain::IPV4,
-        Type::RAW,
-        Some(Protocol::from(255)), // IPPROTO_RAW
-    )?;
+    let socket = Socket::new(Domain::IPV4, Type::RAW, Some(Protocol::from(IPPROTO_RAW)))?;
 
-    set_ip_hdrincl(&socket)?;
+    socket.set_header_included_v4(true)?;
 
     socket.set_nonblocking(false)?;
     socket.set_read_timeout(Some(Duration::from_secs(1)))?;
@@ -230,68 +228,10 @@ pub fn create_raw_hdrincl_socket_with_interface(
     Ok(socket)
 }
 
-/// Enable IP_HDRINCL on a raw IPv4 socket via setsockopt (portable across platforms;
-/// avoids depending on a specific socket2 helper name).
-
-fn set_ip_hdrincl(socket: &Socket) -> Result<()> {
-    // Windows supports IP_HDRINCL too, but libc on Windows does not declare
-    // the option or the BSD fd API, so the raw ws2_32 call is used there.
-    #[cfg(unix)]
-    {
-        use std::os::fd::AsRawFd;
-        let one: libc::c_int = 1;
-        let ret = unsafe {
-            libc::setsockopt(
-                socket.as_raw_fd(),
-                libc::IPPROTO_IP,
-                libc::IP_HDRINCL,
-                &one as *const _ as *const libc::c_void,
-                std::mem::size_of_val(&one) as libc::socklen_t,
-            )
-        };
-        if ret != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
-    }
-    #[cfg(windows)]
-    {
-        const IP_HDRINCL_V4: i32 = 2; // ws2ipdef.h
-        const IPPROTO_IP_W: i32 = 0;
-        use std::os::windows::io::AsRawSocket;
-        type SOCKET = usize;
-        #[link(name = "ws2_32")]
-        unsafe extern "system" {
-            fn setsockopt(
-                s: SOCKET,
-                level: i32,
-                optname: i32,
-                optval: *const u8,
-                optlen: i32,
-            ) -> i32;
-        }
-        let val: u32 = 1;
-        let rc = unsafe {
-            setsockopt(
-                socket.as_raw_socket() as SOCKET,
-                IPPROTO_IP_W,
-                IP_HDRINCL_V4,
-                &val as *const u32 as *const u8,
-                4,
-            )
-        };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
-    }
-}
-
 /// Send a fully-formed IPv4 packet (built with [`build_ipv4_packet`]) to `dst`.
 ///
 /// The destination passed to `sendto` matches the header's destination; the port is
 /// meaningless for raw IP and is set to zero.
-
 pub fn send_raw_ipv4(socket: &Socket, packet: &[u8], dst: Ipv4Addr) -> Result<usize> {
     let addr = SocketAddr::new(IpAddr::V4(dst), 0);
     let sent = socket.send_to(packet, &SockAddr::from(addr))?;
@@ -507,8 +447,7 @@ mod tests {
     // host-order branch NetBSD uses, giving transitive coverage of NetBSD.)
     //
     // Requires root (raw socket); ignored by default. Run with:
-    //   sudo cargo test --lib runtime_hdrincl -- --ignored --nocapture#[cfg(unix)]
-
+    //   sudo cargo test --lib runtime_hdrincl -- --ignored --nocapture
     #[test]
     #[ignore = "requires root (raw socket); run via --ignored under sudo / in CI"]
     fn runtime_hdrincl_send_all_protocols() {

@@ -2,6 +2,8 @@ use anyhow::{Result, anyhow};
 use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 use std::time::Duration;
+#[cfg(windows)]
+use windows_sys::Win32::Networking::WinSock;
 
 /// Socket capability level
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,9 +86,23 @@ pub fn check_permissions() -> Result<SocketCapability> {
     Ok(SocketCapability::Raw)
 }
 
+/// Native Windows probing isn't implemented yet: fail before any socket work.
+#[cfg(windows)]
+pub fn check_permissions() -> Result<SocketCapability> {
+    Err(anyhow!(
+        "Native Windows probing is not supported yet; run ttl under WSL2.\n\
+         (--replay and --diff work natively.)"
+    ))
+}
+
 /// Check socket permissions and return capability level
 /// On Linux, requires RAW sockets for traceroute functionality
-#[cfg(not(any(target_os = "macos", target_os = "freebsd", target_os = "netbsd")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "freebsd",
+    target_os = "netbsd",
+    windows
+)))]
 pub fn check_permissions() -> Result<SocketCapability> {
     // RAW sockets required - DGRAM can't receive Time Exceeded from intermediate routers
     if create_raw_icmp_socket(false).is_ok() {
@@ -267,52 +283,16 @@ pub fn set_ttl(socket: &Socket, ttl: u8, ipv6: bool) -> Result<()> {
 /// DSCP occupies upper 6 bits of TOS byte, so shift left by 2
 pub fn set_dscp(socket: &Socket, dscp: u8, ipv6: bool) -> Result<()> {
     let tos = (dscp as u32) << 2;
-    #[cfg(unix)]
-    {
-        if ipv6 {
-            socket.set_tclass_v6(tos)?;
-        } else {
-            socket.set_tos_v4(tos)?;
-        }
-        return Ok(());
+    if ipv6 {
+        #[cfg(unix)]
+        socket.set_tclass_v6(tos)?;
+        // socket2 exposes IPV6_TCLASS only on unix.
+        #[cfg(windows)]
+        win_setsockopt(socket, WinSock::IPPROTO_IPV6, WinSock::IPV6_TCLASS, tos)?;
+    } else {
+        socket.set_tos_v4(tos)?;
     }
-    // Windows: socket2 does not expose TOS/TCLASS; raw ws2_32 calls.
-    #[cfg(windows)]
-    {
-        const TOS_V4: i32 = 3; // IP_TOS, ws2ipdef.h
-        const TCLASS_V6: i32 = 39; // IPV6_TCLASS
-        const IPPROTO_IP_W: i32 = 0;
-        const IPPROTO_IPV6_W: i32 = 41;
-        use std::os::windows::io::AsRawSocket;
-        type SOCKET = usize;
-        #[link(name = "ws2_32")]
-        unsafe extern "system" {
-            fn setsockopt(
-                s: SOCKET,
-                level: i32,
-                optname: i32,
-                optval: *const u8,
-                optlen: i32,
-            ) -> i32;
-        }
-        let val = tos as u32;
-        let rc = unsafe {
-            setsockopt(
-                socket.as_raw_socket() as SOCKET,
-                if ipv6 { IPPROTO_IPV6_W } else { IPPROTO_IP_W },
-                if ipv6 { TCLASS_V6 } else { TOS_V4 },
-                &val as *const u32 as *const u8,
-                4,
-            )
-        };
-        if rc != 0 {
-            anyhow::bail!(
-                "setsockopt(TOS/TCLASS) failed: {}",
-                std::io::Error::last_os_error()
-            );
-        }
-        Ok(())
-    }
+    Ok(())
 }
 
 /// Bind socket to a specific source IP address.
@@ -453,41 +433,34 @@ pub fn set_dont_fragment(socket: &Socket, ipv6: bool) -> Result<()> {
     Ok(())
 }
 
-/// Windows: IP_DONTFRAGMENT (IPv4) and IPV6_DONTFRAG (IPv6) are real socket
-/// options; socket2 does not expose them yet, so the raw setsockopt call is
-/// made against the socket's raw handle.
+/// Set Don't Fragment flag (Windows): IP_DONTFRAGMENT / IPV6_DONTFRAG.
 #[cfg(windows)]
 pub fn set_dont_fragment(socket: &Socket, ipv6: bool) -> Result<()> {
-    const IP_DONTFRAGMENT_V4: i32 = 2; // ws2ipdef.h
-    const IPV6_DONTFRAG_V6: i32 = 42; // ws2ipdef.h
-    const IPPROTO_IP_W: i32 = 0;
-    const IPPROTO_IPV6_W: i32 = 41;
-
-    use std::os::windows::io::AsRawSocket;
-    type SOCKET = usize;
-    #[link(name = "ws2_32")]
-    unsafe extern "system" {
-        fn setsockopt(s: SOCKET, level: i32, optname: i32, optval: *const u8, optlen: i32) -> i32;
+    if ipv6 {
+        win_setsockopt(socket, WinSock::IPPROTO_IPV6, WinSock::IPV6_DONTFRAG, 1)
+    } else {
+        win_setsockopt(socket, WinSock::IPPROTO_IP, WinSock::IP_DONTFRAGMENT, 1)
     }
-    let val: u32 = 1;
-    let rc = unsafe {
-        setsockopt(
-            socket.as_raw_socket() as SOCKET,
-            if ipv6 { IPPROTO_IPV6_W } else { IPPROTO_IP_W },
-            if ipv6 {
-                IPV6_DONTFRAG_V6
-            } else {
-                IP_DONTFRAGMENT_V4
-            },
-            &val as *const u32 as *const u8,
-            4,
+}
+
+/// `setsockopt` with a `u32` value, for Winsock options socket2 doesn't expose.
+#[cfg(windows)]
+fn win_setsockopt(socket: &Socket, level: i32, name: i32, val: u32) -> Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    // SAFETY: `as_raw_socket()` is a valid open SOCKET for the borrow of `socket`.
+    // `val` is an initialized stack u32 that outlives the call, and the length
+    // passed is exactly its size.
+    let ret = unsafe {
+        WinSock::setsockopt(
+            socket.as_raw_socket() as WinSock::SOCKET,
+            level,
+            name,
+            (&val as *const u32).cast(),
+            size_of::<u32>() as i32,
         )
     };
-    if rc != 0 {
-        anyhow::bail!(
-            "setsockopt(IP_DONTFRAGMENT) failed: {}",
-            std::io::Error::last_os_error()
-        );
+    if ret != 0 {
+        return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
 }
@@ -637,57 +610,28 @@ unsafe fn read_cmsg_ttl(data_ptr: *const libc::c_uchar, data_len: usize) -> u8 {
     }
 }
 
-/// Extract TTL/hop limit from control message
-/// Windows: the ancillary TTL arrives with the native IPHelper backend; the
-/// caller treats this option as best-effort.
-#[cfg(windows)]
-pub fn enable_recv_ttl(_socket: &Socket, _ipv6: bool) -> Result<()> {
-    Ok(())
-}
-
-/// Windows receive path. libc on Windows lacks msghdr/cmsg, so the ancillary
-/// TTL is unavailable until the native backend lands; packets are received
-/// via socket2 with the peer address decoded by the standard SocketAddr path.
+/// Windows receive path. No msghdr/cmsg here, so the response TTL is unavailable.
 #[cfg(windows)]
 pub fn recv_icmp_with_ttl(socket: &Socket, buffer: &mut [u8], _ipv6: bool) -> Result<RecvResult> {
-    use std::net::SocketAddr;
-
-    let (n, from) = {
-        // socket2 wants &mut [MaybeUninit<u8>]; transmute the caller's buffer.
-        let buf: &mut [core::mem::MaybeUninit<u8>] =
-            unsafe { &mut *(buffer as *mut [u8] as *mut [core::mem::MaybeUninit<u8>]) };
-        match socket.recv_from(buf) {
-            Ok(v) => v,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                anyhow::bail!("timeout");
-            }
-            Err(e) => return Err(e.into()),
-        }
-    };
+    // SAFETY: `[u8]` and `[MaybeUninit<u8>]` share layout, and the buffer is already
+    // initialized; `recv_from` only writes initialized bytes into it.
+    let buf = unsafe { &mut *(buffer as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
+    // WouldBlock/TimedOut propagate as io::Error so the receiver treats them as timeouts.
+    let (len, from) = socket.recv_from(buf)?;
     let (source, scope_id) = match from.as_socket() {
         Some(SocketAddr::V4(a)) => (IpAddr::V4(*a.ip()), None),
-        Some(SocketAddr::V6(a)) => {
-            let scope = a.scope_id();
-            (
-                IpAddr::V6(*a.ip()),
-                if scope != 0 { Some(scope) } else { None },
-            )
-        }
-        None => anyhow::bail!("peer address was not a socket address"),
+        Some(SocketAddr::V6(a)) => (IpAddr::V6(*a.ip()), Some(a.scope_id()).filter(|&s| s != 0)),
+        None => anyhow::bail!("peer address was not an IP socket address"),
     };
     Ok(RecvResult {
-        len: n,
+        len,
         source,
         scope_id,
         response_ttl: None,
     })
 }
 
+/// Extract TTL/hop limit from control message
 #[cfg(unix)]
 fn extract_ttl_from_cmsg(msg: &libc::msghdr, ipv6: bool) -> Option<u8> {
     // Platform-specific cmsg type values for IP_TTL
@@ -842,6 +786,36 @@ mod tests {
 
         assert_eq!(decoded.ttl, 15);
         assert_eq!(decoded.seq, 42);
+    }
+
+    /// Reads back the Don't Fragment options; guards the Winsock option constants.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_dont_fragment_readback() {
+        use std::os::windows::io::AsRawSocket;
+        let get = |socket: &Socket, level: i32, name: i32| {
+            let mut val = 0u32;
+            let mut len = size_of::<u32>() as i32;
+            // SAFETY: valid SOCKET for the borrow; `val` and `len` are live, correctly
+            // sized out-params.
+            let ret = unsafe {
+                WinSock::getsockopt(
+                    socket.as_raw_socket() as WinSock::SOCKET,
+                    level,
+                    name,
+                    (&mut val as *mut u32).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(ret, 0, "{}", std::io::Error::last_os_error());
+            val
+        };
+        let v4 = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
+        set_dont_fragment(&v4, false).unwrap();
+        assert_eq!(get(&v4, WinSock::IPPROTO_IP, WinSock::IP_DONTFRAGMENT), 1);
+        let v6 = Socket::new(Domain::IPV6, Type::DGRAM, None).unwrap();
+        set_dont_fragment(&v6, true).unwrap();
+        assert_eq!(get(&v6, WinSock::IPPROTO_IPV6, WinSock::IPV6_DONTFRAG), 1);
     }
 
     #[cfg(unix)]

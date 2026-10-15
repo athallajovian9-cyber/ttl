@@ -3621,7 +3621,6 @@ dependencies = [
  "libc",
  "maxminddb",
  "parking_lot",
- "pnet_base",
  "pnet_datalink",
  "pnet_packet",
  "proptest",
@@ -3636,6 +3635,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "update-informer",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

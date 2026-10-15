@@ -5,7 +5,6 @@
 //! - macOS/FreeBSD: Uses IP_BOUND_IF via socket2::bind_device_by_index()
 
 use anyhow::{Result, anyhow};
-#[cfg(not(windows))]
 #[cfg(unix)]
 use pnet_datalink as datalink;
 use socket2::Socket;
@@ -15,6 +14,7 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 ///
 /// Link-local addresses have the first 10 bits set to 1111111010,
 /// which means the first segment is in the range 0xfe80-0xfebf.
+#[cfg_attr(windows, allow(dead_code))] // only the unix validate_interface uses it
 pub fn is_link_local_ipv6(addr: &Ipv6Addr) -> bool {
     let first_seg = addr.segments()[0];
     (0xfe80..=0xfebf).contains(&first_seg)
@@ -138,13 +138,13 @@ pub use gateway_impl::detect_default_gateway;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use gateway_impl::{detect_gateway_ipv4, detect_gateway_ipv6};
 
-// Stub implementations for FreeBSD and other platforms
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+// Stub implementations for FreeBSD/NetBSD (callers are unix-only)
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn detect_gateway_ipv4(_interface: &str) -> Option<Ipv4Addr> {
     None
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
 fn detect_gateway_ipv6(_interface: &str) -> Option<Ipv6Addr> {
     None
 }
@@ -162,7 +162,7 @@ pub fn detect_default_gateway(_ipv6: bool) -> Option<IpAddr> {
 /// Returns error if:
 /// - Interface does not exist
 /// - Interface has no usable IP addresses (link-local only on non-loopback)
-#[cfg(not(windows))]
+#[cfg(unix)]
 pub fn validate_interface(name: &str) -> Result<InterfaceInfo> {
     for iface in datalink::interfaces() {
         if iface.name == name {
@@ -252,7 +252,6 @@ pub fn validate_interface(name: &str) -> Result<InterfaceInfo> {
 /// On Linux, uses SO_BINDTODEVICE which requires CAP_NET_RAW or root.
 /// On macOS, uses IP_BOUND_IF (IPv4) or IPV6_BOUND_IF (IPv6) with the interface index.
 /// FreeBSD does not support interface binding (no SO_BINDTODEVICE or IP_BOUND_IF).
-#[cfg(not(windows))]
 pub fn bind_socket_to_interface(socket: &Socket, info: &InterfaceInfo, ipv6: bool) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -316,7 +315,6 @@ pub fn bind_socket_to_interface(socket: &Socket, info: &InterfaceInfo, ipv6: boo
 ///
 /// Returns the first address of the requested family, or an error if none exists.
 #[allow(dead_code)]
-#[cfg(not(windows))]
 pub fn get_interface_source_ip(info: &InterfaceInfo, ipv6: bool) -> Result<IpAddr> {
     if ipv6 {
         info.ipv6.map(IpAddr::V6).ok_or_else(|| {
@@ -335,33 +333,17 @@ pub fn get_interface_source_ip(info: &InterfaceInfo, ipv6: bool) -> Result<IpAdd
     }
 }
 
-// Windows: interface enumeration/binding arrives with the IPHelper backend;
-// these return explicit errors so callers fail loudly instead of silently
-// skipping interface features.
+/// Windows: no interface enumeration yet (pnet_datalink needs Npcap there).
 #[cfg(windows)]
 pub fn validate_interface(_name: &str) -> Result<InterfaceInfo> {
-    anyhow::bail!("interface validation is not yet supported on Windows")
-}
-
-#[cfg(windows)]
-pub fn bind_socket_to_interface(
-    _socket: &Socket,
-    _info: &InterfaceInfo,
-    _ipv6: bool,
-) -> Result<()> {
-    anyhow::bail!("interface binding is not yet supported on Windows")
-}
-
-#[cfg(windows)]
-pub fn get_interface_source_ip(_name: &str) -> Result<IpAddr> {
-    anyhow::bail!("interface source address lookup is not yet supported on Windows")
+    anyhow::bail!("--interface is not supported on Windows yet")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[cfg(not(windows))]
+    #[cfg(unix)]
     #[test]
     fn test_nonexistent_interface() {
         let result = validate_interface("nonexistent_interface_12345");

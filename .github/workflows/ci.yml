@@ -69,14 +69,14 @@ jobs:
       - name: Build
         run: cargo build --verbose
 
-      # Native Windows: the library compiles and its platform-neutral core
-      # (parsing, filtering, exports, state, lookup, CLI validation) runs.
-      # The probe send/recv paths land with the IPHelper backend.
-      - name: Run lib tests
-        run: cargo test --lib --verbose
+      # Native Windows probing isn't supported yet (the binary refuses to probe and
+      # points at WSL2); this keeps the crate building and the platform-neutral core
+      # (parsing, exports, state, lookup, CLI validation) tested on Windows.
+      - name: Run tests
+        run: cargo test --verbose
 
       - name: Clippy
-        run: cargo clippy --lib -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
   build-macos:
     runs-on: macos-latest

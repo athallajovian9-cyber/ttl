@@ -35,9 +35,7 @@ clap_complete = "4.6"
 
 # Networking
 socket2 = { version = "0.6", features = ["all"] }
-pnet_base = "0.35"
 pnet_packet = "0.35"
-
 libc = "0.2"
 
 # DNS (note: trust-dns-resolver is now hickory-resolver)
@@ -89,6 +87,9 @@ lto = true
 codegen-units = 1
 strip = true
 
-# libpcap-backed interface enumeration is unix-only; Windows uses the IPHelper backend.
+# pnet_datalink links libpcap/Npcap on Windows; interface enumeration is unix-only for now.
 [target.'cfg(unix)'.dependencies]
 pnet_datalink = "0.35"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }

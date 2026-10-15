@@ -428,28 +428,11 @@ impl Args {
                             }
                             self.source_ip_scope_id = Some(idx);
                         }
-                        #[cfg(windows)]
-                        {
-                            // Windows exposes the same resolution through the
-                            // IP Helper API (iphlpapi.dll), no root required.
-                            #[link(name = "iphlpapi")]
-                            unsafe extern "system" {
-                                fn if_nametoindex(name: *const u8) -> u32;
-                            }
-                            let cname = std::ffi::CString::new(zone)
-                                .map_err(|_| format!("Invalid zone name: {zone}"))?;
-                            let idx = unsafe { if_nametoindex(cname.as_ptr() as *const u8) };
-                            if idx == 0 {
-                                return Err(format!(
-                                    "Unknown interface '{zone}' in --source-ip zone"
-                                ));
-                            }
-                            self.source_ip_scope_id = Some(idx as u32);
-                        }
-                        #[cfg(not(any(unix, windows)))]
+                        #[cfg(not(unix))]
                         {
                             return Err(format!(
-                                "Interface name zone '{zone}' not supported on this platform; use a numeric scope ID"
+                                "Interface name zone '{zone}' not supported on this platform; \
+                                 use a numeric scope ID"
                             ));
                         }
                     }
@@ -794,6 +777,7 @@ mod tests {
         assert!(args.validate().unwrap_err().contains("Invalid source IP"));
     }
 
+    #[cfg(unix)] // interface-name zones resolve via if_nametoindex (unix only)
     #[test]
     fn test_source_ip_invalid_zone_interface() {
         let mut args = make_args(|a| {
