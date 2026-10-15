@@ -9,6 +9,7 @@ use windows_sys::Win32::Networking::WinSock;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SocketCapability {
     /// Full raw socket access - can send/receive with custom IP headers
+    #[cfg_attr(windows, allow(dead_code))] // check_permissions always errors on Windows
     Raw,
     /// Unprivileged ICMP socket (limited functionality)
     /// Note: Only used on Linux; macOS always requires Raw for receiving ICMP errors
